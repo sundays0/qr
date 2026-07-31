@@ -1,0 +1,286 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>QR 发送端</title>
+<style>
+  body { background:#111; color:#eee; text-align:center; font-family:monospace; }
+  canvas { background:#fff; margin:10px; }
+</style>
+</head>
+<body>
+<p><input type="file" id="f"> <span id="msg">请选择文件</span></p>
+<canvas id="cv"></canvas>
+
+<script>
+// ==================== QR 编码器（纯逻辑，无界面依赖） ====================
+
+// ---- 可改参数 ----
+var QR_VERSION = 20;      // QR 版本：20 = 97x97（每帧853字节）；若扫不动改成 10 = 57x57（每帧267字节）
+var FRAME_MS   = 150;     // 每帧停留毫秒数。接收端跟得上可改小（如 100），跟不上改大
+
+// ---- 版本参数表（来自 QR 标准，纠错级别 L）----
+var ECC_PER_BLOCK = { 10: 18, 20: 28 };                 // 每个块的纠错码字数
+var BLOCKS = { 10: [[2,68],[2,69]], 20: [[3,107],[5,108]] }; // [块数, 每块数据码字数]
+var ALIGN_POS = { 10: [6,28,50], 20: [6,34,62,90] };    // 校正图形中心坐标
+
+// ---- GF(256) 有限域（里德-所罗门纠错用）----
+var GF_EXP = [], GF_LOG = [];
+(function () {
+  var x = 1;
+  for (var i = 0; i < 255; i++) {
+    GF_EXP[i] = x; GF_LOG[x] = i;
+    x = x << 1;
+    if (x & 0x100) x = x ^ 0x11D;
+  }
+  for (var i = 255; i < 512; i++) GF_EXP[i] = GF_EXP[i - 255];
+})();
+function gfMul(a, b) {
+  return (a === 0 || b === 0) ? 0 : GF_EXP[GF_LOG[a] + GF_LOG[b]];
+}
+
+// ---- 里德-所罗门纠错 ----
+var rsCache = {};
+function rsGenerator(deg) {
+  var poly = [1];
+  for (var i = 0; i < deg; i++) {
+    var next = [];
+    for (var j = 0; j <= poly.length; j++) next.push(0);
+    for (var j = 0; j < poly.length; j++) {
+      next[j]   = next[j]   ^ gfMul(poly[j], GF_EXP[i]);
+      next[j+1] = next[j+1] ^ poly[j];
+    }
+    poly = next;
+  }
+  return poly;
+}
+function rsRemainder(data, deg) {
+  var gen = rsCache[deg] || (rsCache[deg] = rsGenerator(deg));
+  var buf = data.slice();
+  for (var i = 0; i < deg; i++) buf.push(0);
+  for (var i = 0; i < data.length; i++) {
+    var c = buf[i];
+    if (c !== 0)
+      for (var j = 0; j < gen.length; j++)
+        // gen 按升幂存储，除法需按降幂取用（首项系数为 1）
+        buf[i + j] = buf[i + j] ^ gfMul(gen[gen.length - 1 - j], c);
+  }
+  return buf.slice(data.length);
+}
+
+// ---- 每帧可装的有效载荷字节数（含4字节帧头）----
+function payloadCapacity() {
+  var spec = BLOCKS[QR_VERSION], dataCw = 0;
+  for (var i = 0; i < spec.length; i++) dataCw += spec[i][0] * spec[i][1];
+  return dataCw - 3; // 减去模式头/长度头/终止位的开销
+}
+
+// ---- 字节数组 -> 完整码字序列（数据码字 + 纠错码字，已交织）----
+function buildCodewords(bytes) {
+  var eccLen = ECC_PER_BLOCK[QR_VERSION];
+  var spec = BLOCKS[QR_VERSION];
+  var dataLen = 0, i, j;
+  for (i = 0; i < spec.length; i++) dataLen += spec[i][0] * spec[i][1];
+  if (bytes.length > dataLen - 3) throw "payload too large";
+
+  // 1. 拼比特流：字节模式头(0100) + 16位长度 + 数据 + 终止位 + 填充
+  var bits = [];
+  function pushBits(val, len) {
+    for (var k = len - 1; k >= 0; k--) bits.push((val >>> k) & 1);
+  }
+  pushBits(4, 4);
+  pushBits(bytes.length, 16);
+  for (i = 0; i < bytes.length; i++) pushBits(bytes[i], 8);
+  var cap = dataLen * 8;
+  for (i = 0; i < 4 && bits.length < cap; i++) bits.push(0);
+  while (bits.length % 8 !== 0) bits.push(0);
+  var dataCw = [];
+  for (i = 0; i < bits.length; i += 8) {
+    var b = 0;
+    for (j = 0; j < 8; j++) b = (b << 1) | bits[i + j];
+    dataCw.push(b);
+  }
+  var p = 0, pad = [0xEC, 0x11];
+  while (dataCw.length < dataLen) { dataCw.push(pad[p]); p = p ^ 1; }
+
+  // 2. 分块、算纠错、交织
+  var blocks = [], off = 0;
+  for (i = 0; i < spec.length; i++)
+    for (j = 0; j < spec[i][0]; j++) {
+      var d = dataCw.slice(off, off + spec[i][1]);
+      off += spec[i][1];
+      blocks.push({ data: d, ecc: rsRemainder(d, eccLen) });
+    }
+  var result = [];
+  for (i = 0; i < spec[spec.length - 1][1]; i++)
+    for (j = 0; j < blocks.length; j++)
+      if (i < blocks[j].data.length) result.push(blocks[j].data[i]);
+  for (i = 0; i < eccLen; i++)
+    for (j = 0; j < blocks.length; j++)
+      result.push(blocks[j].ecc[i]);
+  return result;
+}
+
+// ---- 码字 -> QR 矩阵（返回 {size, mod}，mod[y][x]：1=黑 0=白）----
+function makeMatrix(codewords) {
+  var size = 21 + 4 * (QR_VERSION - 1);
+  var mod = [], isFunc = [], r, c, i;
+  for (r = 0; r < size; r++) {
+    mod.push(new Array(size).fill(0));
+    isFunc.push(new Array(size).fill(false));
+  }
+  function set(x, y, dark) { mod[y][x] = dark ? 1 : 0; isFunc[y][x] = true; }
+
+  // 位置探测图形（三个角）+ 分隔符
+  function finder(cx, cy) {
+    for (var dy = -4; dy <= 4; dy++)
+      for (var dx = -4; dx <= 4; dx++) {
+        var x = cx + dx, y = cy + dy;
+        if (x < 0 || x >= size || y < 0 || y >= size) continue;
+        var d = Math.max(Math.abs(dx), Math.abs(dy));
+        set(x, y, d !== 2 && d !== 4);
+      }
+  }
+  finder(3, 3); finder(size - 4, 3); finder(3, size - 4);
+
+  // 定位图形（第6行/第6列的黑白交替线）
+  for (i = 8; i < size - 8; i++) {
+    set(6, i, i % 2 === 0);
+    set(i, 6, i % 2 === 0);
+  }
+
+  // 校正图形
+  var pos = ALIGN_POS[QR_VERSION];
+  for (r = 0; r < pos.length; r++)
+    for (c = 0; c < pos.length; c++) {
+      if ((r === 0 && c === 0) || (r === 0 && c === pos.length - 1) ||
+          (r === pos.length - 1 && c === 0)) continue; // 被探测图形占据的角
+      for (var dy = -2; dy <= 2; dy++)
+        for (var dx = -2; dx <= 2; dx++)
+          set(pos[c] + dx, pos[r] + dy, Math.max(Math.abs(dx), Math.abs(dy)) !== 1);
+    }
+
+  // 版本信息（版本>=7 需要，18比特，写在右上/左下）
+  if (QR_VERSION >= 7) {
+    var rem = QR_VERSION;
+    for (i = 0; i < 12; i++) rem = (rem << 1) ^ (((rem >>> 11) & 1) ? 0x1F25 : 0);
+    var vbits = (QR_VERSION << 12) | rem;
+    for (i = 0; i < 18; i++) {
+      var bit = ((vbits >>> i) & 1) === 1;
+      var a = size - 11 + (i % 3), b = Math.floor(i / 3);
+      set(a, b, bit); set(b, a, bit);
+    }
+  }
+
+  // 格式信息（15比特，mask 固定用 0 号）。先画一遍占位，标记为功能区
+  function drawFormat(mask) {
+    var data = (1 << 3) | mask; // 1 = 纠错级别 L
+    var rem2 = data;
+    for (var k = 0; k < 10; k++) rem2 = (rem2 << 1) ^ (((rem2 >>> 9) & 1) ? 0x537 : 0);
+    var fbits = ((data << 10) | rem2) ^ 0x5412;
+    function fb(k) { return ((fbits >>> k) & 1) === 1; }
+    for (var k = 0; k <= 5; k++) set(8, k, fb(k));
+    set(8, 7, fb(6)); set(8, 8, fb(7)); set(7, 8, fb(8));
+    for (var k = 9; k < 15; k++) set(14 - k, 8, fb(k));
+    for (var k = 0; k < 8; k++) set(size - 1 - k, 8, fb(k));
+    for (var k = 8; k < 15; k++) set(8, size - 15 + k, fb(k));
+    set(8, size - 8, true); // 固定的暗模块
+  }
+  drawFormat(0);
+
+  // 数据填充：从右下角开始，两列一组，蛇形向上/向下
+  var bitIdx = 0, totalBits = codewords.length * 8;
+  for (var right = size - 1; right >= 1; right -= 2) {
+    if (right === 6) right = 5; // 跳过第6列（定位线）
+    for (var vert = 0; vert < size; vert++) {
+      for (var j = 0; j < 2; j++) {
+        var x = right - j;
+        var y = (((right + 1) & 2) === 0) ? size - 1 - vert : vert;
+        if (!isFunc[y][x] && bitIdx < totalBits) {
+          mod[y][x] = (codewords[bitIdx >>> 3] >>> (7 - (bitIdx & 7))) & 1;
+          bitIdx++;
+        }
+      }
+    }
+  }
+
+  // 掩码 0：(行+列) 为偶数的数据位取反，然后重画格式信息
+  for (r = 0; r < size; r++)
+    for (c = 0; c < size; c++)
+      if (!isFunc[r][c] && (r + c) % 2 === 0) mod[r][c] ^= 1;
+  drawFormat(0);
+
+  return { size: size, mod: mod };
+}
+</script>
+
+<script>
+// ==================== 界面与播放逻辑 ====================
+var HEADER = 4; // 帧头：帧序号2字节 + 总帧数2字节
+var frames = [], cur = 0, timer = null;
+var cv = document.getElementById('cv');
+var ctx = cv.getContext('2d');
+
+// 文件 -> 帧数组（每帧一个字节数组，含帧头）
+function buildFrames(name, buf) {
+  var cap = payloadCapacity() - HEADER;
+  var dataFrames = Math.ceil(buf.length / cap) || 1;
+  var total = dataFrames + 1;
+  var out = [];
+
+  // 第0帧：文件名(UTF-8) + 文件大小(4字节小端)
+  var nameBytes = new TextEncoder().encode(name);
+  if (nameBytes.length > 200) nameBytes = nameBytes.slice(0, 200);
+  var meta = [0, 0, 0, 0, nameBytes.length];
+  for (var i = 0; i < nameBytes.length; i++) meta.push(nameBytes[i]);
+  meta.push(buf.length & 255, (buf.length >>> 8) & 255,
+            (buf.length >>> 16) & 255, (buf.length >>> 24) & 255);
+  out.push(withHeader(0, total, meta.slice(4)));
+
+  for (var f = 1; f <= dataFrames; f++)
+    out.push(withHeader(f, total, buf.slice((f - 1) * cap, f * cap)));
+  return out;
+}
+function withHeader(idx, total, payload) {
+  var frame = new Uint8Array(HEADER + payload.length);
+  frame[0] = idx & 255; frame[1] = (idx >>> 8) & 255;
+  frame[2] = total & 255; frame[3] = (total >>> 8) & 255;
+  frame.set(payload, HEADER);
+  return frame;
+}
+
+// 把一帧画到 canvas（含4模块宽静区）
+function drawFrame(bytes) {
+  var m = makeMatrix(buildCodewords(bytes));
+  var scale = Math.max(4, Math.floor(820 / (m.size + 8)));
+  var px = (m.size + 8) * scale;
+  cv.width = px; cv.height = px;
+  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, px, px);
+  ctx.fillStyle = '#000';
+  for (var y = 0; y < m.size; y++)
+    for (var x = 0; x < m.size; x++)
+      if (m.mod[y][x]) ctx.fillRect((x + 4) * scale, (y + 4) * scale, scale, scale);
+}
+
+function play() {
+  drawFrame(frames[cur]);
+  document.getElementById('msg').textContent =
+    '帧 ' + cur + '/' + (frames.length - 1);
+  cur = (cur + 1) % frames.length; // 循环播放，漏帧下一圈补
+}
+
+document.getElementById('f').addEventListener('change', function (e) {
+  var file = e.target.files[0];
+  if (!file) return;
+  var reader = new FileReader();
+  reader.onload = function () {
+    frames = buildFrames(file.name, new Uint8Array(reader.result));
+    cur = 0;
+    if (timer) clearInterval(timer);
+    timer = setInterval(play, FRAME_MS);
+  };
+  reader.readAsArrayBuffer(file);
+});
+</script>
+</body>
+</html>

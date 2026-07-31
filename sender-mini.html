@@ -1,0 +1,227 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<title>QR 发送端</title>
+<style>body{background:#111;color:#eee;text-align:center;font-family:monospace}canvas{background:#fff;margin:10px}</style>
+</head>
+<body>
+<p><input type="file" id="f"> <span id="m">请选择文件</span></p>
+<canvas id="cv"></canvas>
+
+<script>
+// 任何脚本错误直接显示在页面上（IE 调试用）
+window.onerror = function (m, s, l) {
+  document.getElementById('m').textContent = '脚本错误: ' + m + ' (第' + l + '行)';
+};
+
+// 参数：QR_VERSION 20=每帧858字节(扫不动改10=267字节)；FRAME_MS 每帧毫秒
+var QR_VERSION = 20, FRAME_MS = 150;
+var ECC = { 10: 18, 20: 28 };
+var BLK = { 10: [[2,68],[2,69]], 20: [[3,107],[5,108]] };
+var ALN = { 10: [6,28,50], 20: [6,34,62,90] };
+
+// GF(256) 有限域
+var EX = [], LG = [];
+(function () {
+  var x = 1, i;
+  for (i = 0; i < 255; i++) { EX[i] = x; LG[x] = i; x <<= 1; if (x & 256) x ^= 285; }
+  for (i = 255; i < 512; i++) EX[i] = EX[i - 255];
+})();
+function gm(a, b) { return a && b ? EX[LG[a] + LG[b]] : 0; }
+
+// 里德-所罗门纠错（生成多项式按升幂存储，除法时降幂取用）
+var RC = {};
+function rsg(deg) {
+  var p = [1], n, i, j;
+  for (i = 0; i < deg; i++) {
+    for (n = [], j = 0; j <= p.length; j++) n[j] = 0;
+    for (j = 0; j < p.length; j++) { n[j] ^= gm(p[j], EX[i]); n[j + 1] ^= p[j]; }
+    p = n;
+  }
+  return p;
+}
+function rsr(data, deg) {
+  var g = RC[deg] || (RC[deg] = rsg(deg)), b = data.slice(), i, j, c;
+  for (i = 0; i < deg; i++) b.push(0);
+  for (i = 0; i < data.length; i++) {
+    c = b[i];
+    if (c) for (j = 0; j < g.length; j++) b[i + j] ^= gm(g[g.length - 1 - j], c);
+  }
+  return b.slice(data.length);
+}
+
+// 每帧容量（含4字节帧头）
+function payloadCapacity() {
+  var s = BLK[QR_VERSION], n = 0, i;
+  for (i = 0; i < s.length; i++) n += s[i][0] * s[i][1];
+  return n - 3;
+}
+
+// 字节数组 -> 完整码字（数据+纠错，已交织）
+function buildCodewords(by) {
+  var el = ECC[QR_VERSION], sp = BLK[QR_VERSION], dl = 0, i, j, k, b;
+  for (i = 0; i < sp.length; i++) dl += sp[i][0] * sp[i][1];
+  if (by.length > dl - 3) throw "too large";
+  var bt = [];
+  function pb(v, l) { for (k = l - 1; k >= 0; k--) bt.push(v >>> k & 1); }
+  pb(4, 4); pb(by.length, 16);
+  for (i = 0; i < by.length; i++) pb(by[i], 8);
+  for (i = 0; i < 4 && bt.length < dl * 8; i++) bt.push(0);
+  while (bt.length % 8) bt.push(0);
+  var dc = [];
+  for (i = 0; i < bt.length; i += 8) {
+    for (b = 0, j = 0; j < 8; j++) b = b << 1 | bt[i + j];
+    dc.push(b);
+  }
+  var p = 0, PD = [236, 17];
+  while (dc.length < dl) { dc.push(PD[p]); p ^= 1; }
+  var bl = [], o = 0;
+  for (i = 0; i < sp.length; i++)
+    for (j = 0; j < sp[i][0]; j++) {
+      var d = dc.slice(o, o + sp[i][1]); o += sp[i][1];
+      bl.push({ d: d, e: rsr(d, el) });
+    }
+  var R = [];
+  for (i = 0; i < sp[sp.length - 1][1]; i++)
+    for (j = 0; j < bl.length; j++)
+      if (i < bl[j].d.length) R.push(bl[j].d[i]);
+  for (i = 0; i < el; i++)
+    for (j = 0; j < bl.length; j++) R.push(bl[j].e[i]);
+  return R;
+}
+
+// 码字 -> QR 矩阵 {size, mod}（纠错L，掩码0）
+function makeMatrix(cwds) {
+  var S = 21 + 4 * (QR_VERSION - 1), M = [], F = [], r, c, i, j, dx, dy, x, y;
+  for (r = 0; r < S; r++) { M.push(new Uint8Array(S)); F.push(new Uint8Array(S)); } // 零填充，兼作功能区标记
+  function st(x, y, d) { M[y][x] = d ? 1 : 0; F[y][x] = true; }
+  function fnd(cx, cy) {
+    for (dy = -4; dy <= 4; dy++) for (dx = -4; dx <= 4; dx++) {
+      x = cx + dx; y = cy + dy;
+      if (x < 0 || x >= S || y < 0 || y >= S) continue;
+      var d = Math.max(Math.abs(dx), Math.abs(dy));
+      st(x, y, d !== 2 && d !== 4);
+    }
+  }
+  fnd(3, 3); fnd(S - 4, 3); fnd(3, S - 4);
+  for (i = 8; i < S - 8; i++) { st(6, i, i % 2 === 0); st(i, 6, i % 2 === 0); }
+  var ps = ALN[QR_VERSION];
+  for (r = 0; r < ps.length; r++) for (c = 0; c < ps.length; c++) {
+    if ((r === 0 && c === 0) || (r === 0 && c === ps.length - 1) ||
+        (r === ps.length - 1 && c === 0)) continue;
+    for (dy = -2; dy <= 2; dy++) for (dx = -2; dx <= 2; dx++)
+      st(ps[c] + dx, ps[r] + dy, Math.max(Math.abs(dx), Math.abs(dy)) !== 1);
+  }
+  if (QR_VERSION >= 7) {
+    var rm = QR_VERSION;
+    for (i = 0; i < 12; i++) rm = (rm << 1) ^ ((rm >>> 11 & 1) ? 7973 : 0);
+    var vb = QR_VERSION << 12 | rm;
+    for (i = 0; i < 18; i++) {
+      var bit = (vb >>> i & 1) === 1, a = S - 11 + i % 3, b2 = Math.floor(i / 3);
+      st(a, b2, bit); st(b2, a, bit);
+    }
+  }
+  function fmt() { // 格式信息（纠错L + 掩码0，共15比特，含固定暗模块）
+    var fb = (8 << 10), k;
+    for (rm = 8, k = 0; k < 10; k++) rm = (rm << 1) ^ ((rm >>> 9 & 1) ? 0x537 : 0);
+    fb = (fb | rm) ^ 0x5412;
+    function Fb(k) { return (fb >>> k & 1) === 1; }
+    for (k = 0; k <= 5; k++) st(8, k, Fb(k));
+    st(8, 7, Fb(6)); st(8, 8, Fb(7)); st(7, 8, Fb(8));
+    for (k = 9; k < 15; k++) st(14 - k, 8, Fb(k));
+    for (k = 0; k < 8; k++) st(S - 1 - k, 8, Fb(k));
+    for (k = 8; k < 15; k++) st(8, S - 15 + k, Fb(k));
+    st(8, S - 8, true);
+  }
+  fmt();
+  var bi = 0, tb = cwds.length * 8;
+  for (var rt = S - 1; rt >= 1; rt -= 2) {
+    if (rt === 6) rt = 5;
+    for (var vt = 0; vt < S; vt++) for (j = 0; j < 2; j++) {
+      x = rt - j; y = ((rt + 1 & 2) === 0) ? S - 1 - vt : vt;
+      if (!F[y][x] && bi < tb) { M[y][x] = cwds[bi >>> 3] >>> (7 - (bi & 7)) & 1; bi++; }
+    }
+  }
+  for (r = 0; r < S; r++) for (c = 0; c < S; c++)
+    if (!F[r][c] && (r + c) % 2 === 0) M[r][c] ^= 1;
+  fmt();
+  return { size: S, mod: M };
+}
+</script>
+
+<script>
+// 帧头4字节：帧序号(2)+总帧数(2)；第0帧载荷：文件名长(1)+文件名(UTF-8)+文件大小(4小端)
+var frames = [], cur = 0, timer = null;
+var cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+
+// 字符串 -> UTF-8 字节数组（IE 无 TextEncoder，含代理对处理）
+function u8(s) {
+  var a = [], i, c, d;
+  for (i = 0; i < s.length; i++) {
+    c = s.charCodeAt(i);
+    if (c < 128) a.push(c);
+    else if (c < 2048) a.push(192 | c >> 6, 128 | c & 63);
+    else if (c >= 55296 && c < 56320 && i + 1 < s.length) {
+      d = s.charCodeAt(i + 1);
+      if (d >= 56320 && d < 57344) {
+        i++;
+        c = 65536 + ((c - 55296) << 10) + (d - 56320);
+        a.push(240 | c >>> 18, 128 | c >>> 12 & 63, 128 | c >>> 6 & 63, 128 | c & 63);
+      } else a.push(239, 191, 189); // 孤立代理 -> U+FFFD
+    } else a.push(224 | c >> 12, 128 | c >> 6 & 63, 128 | c & 63);
+  }
+  return a;
+}
+
+function wh(i, t, p) {
+  var f = new Uint8Array(4 + p.length), k;
+  f[0] = i & 255; f[1] = i >>> 8 & 255; f[2] = t & 255; f[3] = t >>> 8 & 255;
+  for (k = 0; k < p.length; k++) f[4 + k] = p[k]; // 不用 f.set，规避 IE 兼容性问题
+  return f;
+}
+function buildFrames(name, buf) {
+  var cp = payloadCapacity() - 4, nd = Math.ceil(buf.length / cp) || 1, tot = nd + 1, out = [];
+  if (tot > 65535) { alert('文件太大，最多约' + Math.floor(65534 * cp / 1048576) + 'MB'); return []; }
+  var nb = u8(name);
+  if (nb.length > 200) nb = nb.slice(0, 200);
+  var mt = [nb.length], i;
+  for (i = 0; i < nb.length; i++) mt.push(nb[i]);
+  mt.push(buf.length & 255, buf.length >>> 8 & 255, buf.length >>> 16 & 255, buf.length >>> 24 & 255);
+  out.push(wh(0, tot, mt));
+  for (i = 1; i <= nd; i++) out.push(wh(i, tot, buf.subarray((i - 1) * cp, i * cp)));
+  return out;
+}
+function draw(by) {
+  var m = makeMatrix(buildCodewords(by));
+  var sc = Math.max(4, Math.floor(820 / (m.size + 8))), px = (m.size + 8) * sc, x, y;
+  cv.width = px; cv.height = px;
+  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, px, px);
+  ctx.fillStyle = '#000';
+  for (y = 0; y < m.size; y++) for (x = 0; x < m.size; x++)
+    if (m.mod[y][x]) ctx.fillRect((x + 4) * sc, (y + 4) * sc, sc, sc);
+}
+function play() {
+  draw(frames[cur]);
+  document.getElementById('m').textContent = '帧 ' + cur + '/' + (frames.length - 1);
+  cur = (cur + 1) % frames.length;
+}
+document.getElementById('f').addEventListener('change', function (e) {
+  var fl = e.target.files[0];
+  if (!fl) return;
+  var rd = new FileReader();
+  rd.onload = function () {
+    frames = buildFrames(fl.name, new Uint8Array(rd.result));
+    if (!frames.length) return;
+    cur = 0;
+    if (timer) clearInterval(timer);
+    timer = setInterval(play, FRAME_MS);
+  };
+  rd.readAsArrayBuffer(fl);
+});
+// 脚本成功执行的标志：看到这行字说明 JS 没有被 IE 拦截
+document.getElementById('m').textContent = '就绪，请选择文件';
+</script>
+</body>
+</html>
