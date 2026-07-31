@@ -10126,9 +10126,19 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
 <script>
 // ==================== 接收重组逻辑（纯逻辑，无界面依赖） ====================
 
-// 帧格式（与 sender.html 配套）：
+// CRC32 校验（与发送端一致），用于端到端完整性验证
+function crc32(a) {
+  var c = ~0, i, k;
+  for (i = 0; i < a.length; i++) {
+    c ^= a[i];
+    for (k = 0; k < 8; k++) c = (c >>> 1) ^ (c & 1 ? 0xEDB88320 : 0);
+  }
+  return ~c >>> 0;
+}
+
+// 帧格式（与 sender 配套）：
 //   帧头4字节：帧序号(2字节小端) + 总帧数(2字节小端)
-//   第0帧载荷：文件名长度(1字节) + 文件名(UTF-8) + 文件大小(4字节小端)
+//   第0帧载荷：文件名长度(1字节) + 文件名(UTF-8) + 文件大小(4字节小端) [+ CRC32(4字节小端)]
 //   第1..N帧载荷：文件数据，按序拼接
 function createReceiver() {
   var r = {
@@ -10136,10 +10146,11 @@ function createReceiver() {
     received: 0,   // 已收到的不同帧数
     name: '',      // 文件名（来自第0帧）
     size: 0,       // 文件大小（来自第0帧）
+    crc: null,     // 文件 CRC32（来自第0帧，旧版发送端没有则为 null）
     chunks: null,  // 按帧序号存放的载荷
     done: false,
 
-    // 喂入一帧解码出的字节。返回 'ok' | 'dup' | 'bad' | 'reset'
+    // 喂入一帧解码出的字节。返回 'ok' | 'dup' | 'bad'
     push: function (bytes) {
       if (bytes.length < 4) return 'bad';
       var idx   = bytes[0] | (bytes[1] << 8);
@@ -10149,26 +10160,39 @@ function createReceiver() {
       // 发送端换了文件（总帧数不同）：丢弃旧进度，重新开始
       if (r.total !== 0 && total !== r.total) {
         r.total = 0; r.chunks = null; r.received = 0;
-        r.name = ''; r.size = 0; r.done = false;
+        r.name = ''; r.size = 0; r.crc = null; r.done = false;
       }
       if (r.total === 0) {
         r.total = total;
         r.chunks = new Array(total);
         r.received = 0;
       }
-      if (r.chunks[idx]) return 'dup'; // 循环播放时的重复帧
 
       var payload = bytes.slice(4);
       if (idx === 0) {
+        if (r.chunks[0]) return 'dup';
+        // 元数据帧合法性校验：抵御摄像头误解码产生的垃圾帧
         if (payload.length < 5) return 'bad';
         var nl = payload[0];
-        if (payload.length < 1 + nl + 4) return 'bad';
+        if (nl > 200 || payload.length < 1 + nl + 4) return 'bad';
+        for (var z = 1; z <= nl; z++) if (payload[z] === 0) return 'bad'; // 文件名不应含0x00
+        var size = (payload[1 + nl] | (payload[2 + nl] << 8) |
+                    (payload[3 + nl] << 16) | (payload[4 + nl] << 24)) >>> 0;
+        if (size > 55986036) return 'bad'; // 协议上限 65534 帧 * 854 字节
         r.name = new TextDecoder().decode(new Uint8Array(payload.slice(1, 1 + nl)));
-        r.size = payload[1 + nl] | (payload[2 + nl] << 8) |
-                 (payload[3 + nl] << 16) | (payload[4 + nl] << 24);
+        r.size = size;
+        if (payload.length >= 1 + nl + 8) { // 新版发送端附带 CRC32
+          r.crc = (payload[5 + nl] | (payload[6 + nl] << 8) |
+                   (payload[7 + nl] << 16) | (payload[8 + nl] << 24)) >>> 0;
+        }
+        r.chunks[0] = payload;
+        r.received++;
+        return 'ok';
       }
+
+      // 数据帧允许覆盖：误解码的垃圾帧在下一圈会被正确帧修复
+      if (!r.chunks[idx]) r.received++;
       r.chunks[idx] = payload;
-      r.received++;
       if (r.received === r.total && r.chunks[0]) r.done = true;
       return 'ok';
     },
@@ -10202,6 +10226,8 @@ var pg = document.getElementById('pg');
 var dl = document.getElementById('dl');
 var scanning = false;
 var wakeLock = null;
+var errCount = 0;       // 解码异常计数（诊断用）
+var lastTick = Date.now(); // 看门狗用：最后一次扫描循环时间
 
 // 注册离线缓存（首次打开后，以后无网络也能用）
 if ('serviceWorker' in navigator) {
@@ -10220,38 +10246,59 @@ document.addEventListener('visibilitychange', function () {
 
 function scanFrame() {
   if (!scanning) return;
-  if (v.readyState >= v.HAVE_CURRENT_DATA && v.videoWidth > 0) {
-    // 限宽 1280 以兼顾识别率与速度
-    var scale = Math.min(1, 1280 / v.videoWidth);
-    cv.width = Math.round(v.videoWidth * scale);
-    cv.height = Math.round(v.videoHeight * scale);
-    ctx.drawImage(v, 0, 0, cv.width, cv.height);
-    var img = ctx.getImageData(0, 0, cv.width, cv.height);
-    var code = jsQR(img.data, cv.width, cv.height);
-    if (code && code.binaryData && code.binaryData.length) {
-      var st = receiver.push(code.binaryData);
-      if (st === 'ok') {
-        msg.textContent = (receiver.name || '...') + '  已收 ' +
-          receiver.received + '/' + receiver.total + ' 帧';
-        pg.max = receiver.total;
-        pg.value = receiver.received;
-        if (receiver.done) return finish();
+  lastTick = Date.now();
+  try {
+    if (v.readyState >= v.HAVE_CURRENT_DATA && v.videoWidth > 0) {
+      // 限宽 1280 以兼顾识别率与速度
+      var scale = Math.min(1, 1280 / v.videoWidth);
+      cv.width = Math.round(v.videoWidth * scale);
+      cv.height = Math.round(v.videoHeight * scale);
+      ctx.drawImage(v, 0, 0, cv.width, cv.height);
+      var img = ctx.getImageData(0, 0, cv.width, cv.height);
+      var code = jsQR(img.data, cv.width, cv.height);
+      if (code && code.binaryData && code.binaryData.length) {
+        var st = receiver.push(code.binaryData);
+        if (st === 'ok') {
+          msg.textContent = (receiver.name || '...') + '  已收 ' +
+            receiver.received + '/' + receiver.total + ' 帧' +
+            (errCount ? '（已容错 ' + errCount + ' 次）' : '');
+          pg.max = receiver.total;
+          pg.value = receiver.received;
+          if (receiver.done && finish()) return; // finish 返回 true 才停止循环
+        }
       }
     }
+  } catch (e) {
+    errCount++; // 任何一帧出错都不能让循环停止
   }
   requestAnimationFrame(scanFrame);
 }
 
+// 看门狗：requestAnimationFrame 链意外中断时自动重启
+setInterval(function () {
+  if (scanning && Date.now() - lastTick > 5000) requestAnimationFrame(scanFrame);
+}, 5000);
+
+// 收齐后处理。返回 true = 校验通过已出文件（停止扫描）；false = 校验失败已自动重开
 function finish() {
-  scanning = false;
   var bytes = receiver.assemble();
+  if (receiver.crc !== null && crc32(bytes) !== receiver.crc) {
+    // 有数据帧被摄像头误解码污染：发送端还在循环播放，直接重来一圈
+    receiver = createReceiver();
+    pg.value = 0;
+    msg.textContent = '校验失败，已自动重新开始接收…';
+    return false;
+  }
+  scanning = false;
   var blob = new Blob([bytes]);
   if (dl.href) URL.revokeObjectURL(dl.href);
   dl.href = URL.createObjectURL(blob);
   dl.download = receiver.name || 'received.bin';
   dl.textContent = '下载 ' + dl.download + '（' + bytes.length + ' 字节）';
   dl.hidden = false;
-  msg.textContent = '接收完成 ✅ ' + receiver.received + '/' + receiver.total + ' 帧';
+  msg.textContent = '接收完成 ✅ ' + receiver.received + '/' + receiver.total + ' 帧' +
+    (receiver.crc !== null ? '，CRC 校验通过' : '');
+  return true;
 }
 
 document.getElementById('start').addEventListener('click', function () {
