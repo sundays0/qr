@@ -1,5 +1,5 @@
 // QR 接收端离线缓存：首次打开后，以后无网络也能用
-var CACHE = 'qr-receiver-v3';
+var CACHE = 'qr-receiver-v5'; // receiver v1.2（与页面底部版本号保持同步）
 self.addEventListener('install', function (e) {
   e.waitUntil(
     caches.open(CACHE)
