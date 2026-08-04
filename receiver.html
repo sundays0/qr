@@ -10228,6 +10228,7 @@ var scanning = false;
 var wakeLock = null;
 var errCount = 0;       // 解码异常计数（诊断用）
 var lastTick = Date.now(); // 看门狗用：最后一次扫描循环时间
+var SCAN_W = 1000;      // 扫码分辨率上限（像素宽）：调小解码更快、调大更易识别高密度码
 
 // 注册离线缓存（首次打开后，以后无网络也能用）
 if ('serviceWorker' in navigator) {
@@ -10249,13 +10250,13 @@ function scanFrame() {
   lastTick = Date.now();
   try {
     if (v.readyState >= v.HAVE_CURRENT_DATA && v.videoWidth > 0) {
-      // 限宽 1280 以兼顾识别率与速度
-      var scale = Math.min(1, 1280 / v.videoWidth);
+      var scale = Math.min(1, SCAN_W / v.videoWidth);
       cv.width = Math.round(v.videoWidth * scale);
       cv.height = Math.round(v.videoHeight * scale);
       ctx.drawImage(v, 0, 0, cv.width, cv.height);
       var img = ctx.getImageData(0, 0, cv.width, cv.height);
-      var code = jsQR(img.data, cv.width, cv.height);
+      // dontInvert：我们的码永远是黑底白块，跳过反色二次尝试，失败帧成本减半
+      var code = jsQR(img.data, cv.width, cv.height, { inversionAttempts: 'dontInvert' });
       if (code && code.binaryData && code.binaryData.length) {
         var st = receiver.push(code.binaryData);
         if (st === 'ok') {
